@@ -7,6 +7,7 @@ assets = { directory = "./dist", not_found_handling = "single-page-application",
 [[d1_databases]]
 binding = "DB"
 database_name = "nodewarden-db"
+database_id = "e02c11d6-f293-49c6-a593-77b3e2a9282d"
 
 # R2 Bucket for storing attachments
 [[r2_buckets]]
