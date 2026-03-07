@@ -55,10 +55,14 @@ export default function SettingsPage(props: SettingsPageProps) {
   }, [props.profile.email, secret]);
 
   async function enableTotp(): Promise<void> {
-    await props.onEnableTotp(secret, token);
-    // Secret is now stored on the server; remove plaintext copy from localStorage.
-    localStorage.removeItem(totpSecretStorageKey);
-    setTotpLocked(true);
+    try {
+      await props.onEnableTotp(secret, token);
+      // Secret is now stored on the server; remove plaintext copy from localStorage.
+      localStorage.removeItem(totpSecretStorageKey);
+      setTotpLocked(true);
+    } catch {
+      // Keep inputs editable after a failed attempt.
+    }
   }
 
   async function loadRecoveryCode(): Promise<void> {
@@ -178,6 +182,7 @@ export default function SettingsPage(props: SettingsPageProps) {
                   props.onNotify?.('success', t('txt_recovery_code_copied'));
                 }}
               >
+                <Clipboard size={14} className="btn-icon" />
                 {t('txt_copy_code')}
               </button>
             </div>

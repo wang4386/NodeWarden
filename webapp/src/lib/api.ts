@@ -80,6 +80,13 @@ export interface PreloginResult {
   kdfIterations: number;
 }
 
+export interface PreloginKdfConfig {
+  kdfType: number;
+  kdfIterations: number;
+  kdfMemory: number | null;
+  kdfParallelism: number | null;
+}
+
 function randomHex(length: number): string {
   const bytes = crypto.getRandomValues(new Uint8Array(Math.max(1, Math.ceil(length / 2))));
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, length);
@@ -128,6 +135,24 @@ export async function deriveLoginHash(email: string, password: string, fallbackI
   const masterKey = await pbkdf2(password, email.toLowerCase(), iterations, 32);
   const hash = await pbkdf2(masterKey, password, 1, 32);
   return { hash: bytesToBase64(hash), masterKey, kdfIterations: iterations };
+}
+
+export async function getPreloginKdfConfig(email: string, fallbackIterations: number): Promise<PreloginKdfConfig> {
+  const normalized = String(email || '').trim().toLowerCase();
+  if (!normalized) throw new Error('Email is required');
+  const pre = await fetch('/identity/accounts/prelogin', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: normalized }),
+  });
+  if (!pre.ok) throw new Error('prelogin failed');
+  const data = (await parseJson<{ kdf?: number; kdfIterations?: number; kdfMemory?: number | null; kdfParallelism?: number | null }>(pre)) || {};
+  return {
+    kdfType: Number(data.kdf ?? 0) || 0,
+    kdfIterations: Number(data.kdfIterations || fallbackIterations),
+    kdfMemory: data.kdfMemory == null ? null : Number(data.kdfMemory),
+    kdfParallelism: data.kdfParallelism == null ? null : Number(data.kdfParallelism),
+  };
 }
 
 export async function loginWithPassword(
@@ -306,14 +331,54 @@ export async function getFolders(authedFetch: (input: string, init?: RequestInit
 
 export async function createFolder(
   authedFetch: (input: string, init?: RequestInit) => Promise<Response>,
+  session: SessionState,
   name: string
-): Promise<void> {
+): Promise<{ id: string; name?: string | null }> {
+  if (!session.symEncKey || !session.symMacKey) throw new Error('Vault key unavailable');
+  const enc = base64ToBytes(session.symEncKey);
+  const mac = base64ToBytes(session.symMacKey);
+  const encryptedName = await encryptBw(new TextEncoder().encode(name), enc, mac);
   const resp = await authedFetch('/api/folders', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name: encryptedName }),
   });
   if (!resp.ok) throw new Error('Create folder failed');
+  const body = await parseJson<{ id?: string; name?: string | null }>(resp);
+  if (!body?.id) throw new Error('Create folder failed');
+  return { id: body.id, name: body.name ?? null };
+}
+
+export async function deleteFolder(
+  authedFetch: (input: string, init?: RequestInit) => Promise<Response>,
+  folderId: string
+): Promise<void> {
+  const id = String(folderId || '').trim();
+  if (!id) throw new Error('Folder id is required');
+  const resp = await authedFetch(`/api/folders/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+  if (!resp.ok) throw new Error('Delete folder failed');
+}
+
+export async function updateFolder(
+  authedFetch: (input: string, init?: RequestInit) => Promise<Response>,
+  session: SessionState,
+  folderId: string,
+  name: string
+): Promise<void> {
+  const id = String(folderId || '').trim();
+  if (!id) throw new Error('Folder id is required');
+  if (!session.symEncKey || !session.symMacKey) throw new Error('Vault key unavailable');
+  const enc = base64ToBytes(session.symEncKey);
+  const mac = base64ToBytes(session.symMacKey);
+  const encryptedName = await encryptBw(new TextEncoder().encode(name), enc, mac);
+  const resp = await authedFetch(`/api/folders/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: encryptedName }),
+  });
+  if (!resp.ok) throw new Error('Update folder failed');
 }
 
 export async function getCiphers(authedFetch: (input: string, init?: RequestInit) => Promise<Response>): Promise<Cipher[]> {
@@ -321,6 +386,221 @@ export async function getCiphers(authedFetch: (input: string, init?: RequestInit
   if (!resp.ok) throw new Error('Failed to load ciphers');
   const body = await parseJson<ListResponse<Cipher>>(resp);
   return body?.data || [];
+}
+
+export interface CiphersImportPayload {
+  ciphers: Array<Record<string, unknown>>;
+  folders: Array<{ name: string }>;
+  folderRelationships: Array<{ key: number; value: number }>;
+}
+
+export interface ImportedCipherMapEntry {
+  index: number;
+  sourceId: string | null;
+  id: string;
+}
+
+export async function importCiphers(
+  authedFetch: (input: string, init?: RequestInit) => Promise<Response>,
+  payload: CiphersImportPayload,
+  options?: { returnCipherMap?: boolean }
+): Promise<ImportedCipherMapEntry[] | null> {
+  const returnCipherMap = !!options?.returnCipherMap;
+  const url = returnCipherMap ? '/api/ciphers/import?returnCipherMap=1' : '/api/ciphers/import';
+  const resp = await authedFetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!resp.ok) throw new Error(await parseErrorMessage(resp, 'Import failed'));
+  if (!returnCipherMap) return null;
+  const body =
+    (await parseJson<{
+      cipherMap?: Array<{ index?: number; sourceId?: string | null; id?: string }>;
+    }>(resp)) || {};
+  if (!Array.isArray(body.cipherMap)) return [];
+  const out: ImportedCipherMapEntry[] = [];
+  for (const row of body.cipherMap) {
+    const index = Number(row?.index);
+    const id = String(row?.id || '').trim();
+    if (!Number.isFinite(index) || !id) continue;
+    const sourceRaw = String(row?.sourceId || '').trim();
+    out.push({
+      index,
+      id,
+      sourceId: sourceRaw || null,
+    });
+  }
+  return out;
+}
+
+export interface AttachmentDownloadInfo {
+  id: string;
+  url: string;
+  fileName: string | null;
+  key: string | null;
+  size: string | null;
+  sizeName: string | null;
+}
+
+export async function getAttachmentDownloadInfo(
+  authedFetch: (input: string, init?: RequestInit) => Promise<Response>,
+  cipherId: string,
+  attachmentId: string
+): Promise<AttachmentDownloadInfo> {
+  const resp = await authedFetch(`/api/ciphers/${encodeURIComponent(cipherId)}/attachment/${encodeURIComponent(attachmentId)}`);
+  if (!resp.ok) throw new Error(await parseErrorMessage(resp, 'Failed to load attachment'));
+  const body =
+    (await parseJson<{
+      id?: string;
+      url?: string;
+      fileName?: string | null;
+      key?: string | null;
+      size?: string | null;
+      sizeName?: string | null;
+    }>(resp)) || {};
+  const id = String(body.id || attachmentId || '').trim();
+  const url = String(body.url || '').trim();
+  if (!id || !url) throw new Error('Invalid attachment download response');
+  return {
+    id,
+    url,
+    fileName: body.fileName ?? null,
+    key: body.key ?? null,
+    size: body.size ?? null,
+    sizeName: body.sizeName ?? null,
+  };
+}
+
+function looksLikeCipherString(value: unknown): boolean {
+  return /^\d+\.[A-Za-z0-9+/=]+\|[A-Za-z0-9+/=]+(?:\|[A-Za-z0-9+/=]+)?$/.test(String(value || '').trim());
+}
+
+export async function uploadCipherAttachment(
+  authedFetch: (input: string, init?: RequestInit) => Promise<Response>,
+  session: SessionState,
+  cipherId: string,
+  file: File,
+  cipherForKey?: Cipher | null
+): Promise<void> {
+  if (!session.symEncKey || !session.symMacKey) throw new Error('Vault key unavailable');
+  const id = String(cipherId || '').trim();
+  if (!id) throw new Error('Cipher id is required');
+  if (!file) throw new Error('File is required');
+
+  const userEnc = base64ToBytes(session.symEncKey);
+  const userMac = base64ToBytes(session.symMacKey);
+  const itemKeys = await getCipherKeys(cipherForKey || null, userEnc, userMac);
+
+  const encryptedFileName = await encryptTextValue(file.name, itemKeys.enc, itemKeys.mac);
+  if (!encryptedFileName) throw new Error('Invalid attachment name');
+
+  const attachmentRawKey = crypto.getRandomValues(new Uint8Array(64));
+  const attachmentWrappedKey = await encryptBw(attachmentRawKey, itemKeys.enc, itemKeys.mac);
+  const fileBytes = new Uint8Array(await file.arrayBuffer());
+  const encryptedBytes = await encryptBwFileData(fileBytes, attachmentRawKey.slice(0, 32), attachmentRawKey.slice(32, 64));
+
+  const metaResp = await authedFetch(`/api/ciphers/${encodeURIComponent(id)}/attachment/v2`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      fileName: encryptedFileName,
+      key: attachmentWrappedKey,
+      fileSize: encryptedBytes.byteLength,
+    }),
+  });
+  if (!metaResp.ok) throw new Error(await parseErrorMessage(metaResp, 'Create attachment failed'));
+
+  const meta =
+    (await parseJson<{
+      attachmentId?: string;
+      url?: string;
+    }>(metaResp)) || {};
+  const attachmentId = String(meta.attachmentId || '').trim();
+  const uploadUrl = String(meta.url || '').trim();
+  if (!attachmentId || !uploadUrl) throw new Error('Create attachment failed');
+
+  const payload = new ArrayBuffer(encryptedBytes.byteLength);
+  new Uint8Array(payload).set(encryptedBytes);
+  const formData = new FormData();
+  formData.set('data', new Blob([payload], { type: 'application/octet-stream' }), encryptedFileName);
+
+  const uploadResp = await authedFetch(uploadUrl, {
+    method: 'POST',
+    body: formData,
+  });
+  if (!uploadResp.ok) {
+    try {
+      await authedFetch(`/api/ciphers/${encodeURIComponent(id)}/attachment/${encodeURIComponent(attachmentId)}`, { method: 'DELETE' });
+    } catch {
+      // ignore rollback failure
+    }
+    throw new Error(await parseErrorMessage(uploadResp, 'Upload attachment failed'));
+  }
+}
+
+export async function deleteCipherAttachment(
+  authedFetch: (input: string, init?: RequestInit) => Promise<Response>,
+  cipherId: string,
+  attachmentId: string
+): Promise<void> {
+  const cid = String(cipherId || '').trim();
+  const aid = String(attachmentId || '').trim();
+  if (!cid || !aid) throw new Error('Attachment id is required');
+  const resp = await authedFetch(`/api/ciphers/${encodeURIComponent(cid)}/attachment/${encodeURIComponent(aid)}`, {
+    method: 'DELETE',
+  });
+  if (!resp.ok) throw new Error(await parseErrorMessage(resp, 'Delete attachment failed'));
+}
+
+export async function downloadCipherAttachmentDecrypted(
+  authedFetch: (input: string, init?: RequestInit) => Promise<Response>,
+  session: SessionState,
+  cipher: Cipher,
+  attachmentId: string
+): Promise<{ fileName: string; bytes: Uint8Array }> {
+  if (!session.symEncKey || !session.symMacKey) throw new Error('Vault key unavailable');
+  const cid = String(cipher?.id || '').trim();
+  const aid = String(attachmentId || '').trim();
+  if (!cid || !aid) throw new Error('Attachment id is required');
+
+  const info = await getAttachmentDownloadInfo(authedFetch, cid, aid);
+  const rawResp = await fetch(info.url, { cache: 'no-store' });
+  if (!rawResp.ok) throw new Error('Download attachment failed');
+  const encryptedBytes = new Uint8Array(await rawResp.arrayBuffer());
+
+  const userEnc = base64ToBytes(session.symEncKey);
+  const userMac = base64ToBytes(session.symMacKey);
+  const itemKeys = await getCipherKeys(cipher, userEnc, userMac);
+
+  let fileEnc = itemKeys.enc;
+  let fileMac = itemKeys.mac;
+  const keyCipher = String(info.key || '').trim();
+  if (keyCipher && looksLikeCipherString(keyCipher)) {
+    try {
+      const fileRawKey = await decryptBw(keyCipher, itemKeys.enc, itemKeys.mac);
+      if (fileRawKey.length >= 64) {
+        fileEnc = fileRawKey.slice(0, 32);
+        fileMac = fileRawKey.slice(32, 64);
+      }
+    } catch {
+      // fallback to item key
+    }
+  }
+
+  const plainBytes = await decryptBwFileData(encryptedBytes, fileEnc, fileMac);
+
+  const fileNameRaw = String(info.fileName || '').trim();
+  let fileName = fileNameRaw || `attachment-${aid}`;
+  if (fileNameRaw && looksLikeCipherString(fileNameRaw)) {
+    try {
+      fileName = (await decryptStr(fileNameRaw, itemKeys.enc, itemKeys.mac)) || fileName;
+    } catch {
+      // keep fallback name
+    }
+  }
+
+  return { fileName, bytes: plainBytes };
 }
 
 export async function getSends(authedFetch: (input: string, init?: RequestInit) => Promise<Response>): Promise<Send[]> {
@@ -571,6 +851,50 @@ async function encryptUris(uris: string[], enc: Uint8Array, mac: Uint8Array): Pr
   return out;
 }
 
+function asFidoString(value: unknown, fallback = ''): string {
+  const normalized = String(value ?? '').trim();
+  return normalized || fallback;
+}
+
+function asNullableFidoString(value: unknown): string | null {
+  const normalized = String(value ?? '').trim();
+  return normalized || null;
+}
+
+function toIsoDateOrNow(value: unknown): string {
+  const raw = String(value ?? '').trim();
+  if (!raw) return new Date().toISOString();
+  const parsed = new Date(raw);
+  if (!Number.isFinite(parsed.getTime())) return new Date().toISOString();
+  return parsed.toISOString();
+}
+
+function normalizeFido2Credentials(
+  credentials: Array<Record<string, unknown>> | null | undefined
+): Array<Record<string, unknown>> | null {
+  if (!Array.isArray(credentials) || credentials.length === 0) return null;
+  const out: Array<Record<string, unknown>> = [];
+  for (const credential of credentials) {
+    if (!credential || typeof credential !== 'object') continue;
+    out.push({
+      credentialId: asFidoString(credential.credentialId),
+      keyType: asFidoString(credential.keyType, 'public-key'),
+      keyAlgorithm: asFidoString(credential.keyAlgorithm, 'ECDSA'),
+      keyCurve: asFidoString(credential.keyCurve, 'P-256'),
+      keyValue: asFidoString(credential.keyValue),
+      rpId: asFidoString(credential.rpId),
+      rpName: asNullableFidoString(credential.rpName),
+      userHandle: asNullableFidoString(credential.userHandle),
+      userName: asNullableFidoString(credential.userName),
+      userDisplayName: asNullableFidoString(credential.userDisplayName),
+      counter: asFidoString(credential.counter, '0'),
+      discoverable: asFidoString(credential.discoverable, 'false'),
+      creationDate: toIsoDateOrNow(credential.creationDate),
+    });
+  }
+  return out.length ? out : null;
+}
+
 async function getCipherKeys(cipher: Cipher | null, userEnc: Uint8Array, userMac: Uint8Array): Promise<{ enc: Uint8Array; mac: Uint8Array; key: string | null }> {
   if (cipher?.key) {
     try {
@@ -587,7 +911,7 @@ export async function createCipher(
   authedFetch: (input: string, init?: RequestInit) => Promise<Response>,
   session: SessionState,
   draft: VaultDraft
-): Promise<void> {
+): Promise<{ id: string }> {
   if (!session.symEncKey || !session.symMacKey) throw new Error('Vault key unavailable');
   const enc = base64ToBytes(session.symEncKey);
   const mac = base64ToBytes(session.symMacKey);
@@ -613,6 +937,7 @@ export async function createCipher(
       username: await encryptTextValue(draft.loginUsername, enc, mac),
       password: await encryptTextValue(draft.loginPassword, enc, mac),
       totp: await encryptTextValue(draft.loginTotp, enc, mac),
+      fido2Credentials: normalizeFido2Credentials(draft.loginFido2Credentials),
       uris: await encryptUris(draft.loginUris || [], enc, mac),
     };
   } else if (type === 3) {
@@ -646,10 +971,13 @@ export async function createCipher(
       country: await encryptTextValue(draft.identCountry, enc, mac),
     };
   } else if (type === 5) {
+    const encryptedFingerprint = await encryptTextValue(draft.sshFingerprint, enc, mac);
     payload.sshKey = {
       privateKey: await encryptTextValue(draft.sshPrivateKey, enc, mac),
       publicKey: await encryptTextValue(draft.sshPublicKey, enc, mac),
-      fingerprint: await encryptTextValue(draft.sshFingerprint, enc, mac),
+      keyFingerprint: encryptedFingerprint,
+      // Keep legacy alias for backward compatibility with previously exported/edited items.
+      fingerprint: encryptedFingerprint,
     };
   } else if (type === 2) {
     payload.secureNote = { type: 0 };
@@ -661,6 +989,9 @@ export async function createCipher(
     body: JSON.stringify(payload),
   });
   if (!resp.ok) throw new Error('Create item failed');
+  const body = await parseJson<{ id?: string }>(resp);
+  if (!body?.id) throw new Error('Create item failed');
+  return { id: body.id };
 }
 
 export async function updateCipher(
@@ -693,10 +1024,15 @@ export async function updateCipher(
   };
 
   if (type === 1) {
+    const existingFido2 =
+      cipher.login && Array.isArray((cipher.login as any).fido2Credentials)
+        ? (cipher.login as any).fido2Credentials
+        : null;
     payload.login = {
       username: await encryptTextValue(draft.loginUsername, keys.enc, keys.mac),
       password: await encryptTextValue(draft.loginPassword, keys.enc, keys.mac),
       totp: await encryptTextValue(draft.loginTotp, keys.enc, keys.mac),
+      fido2Credentials: normalizeFido2Credentials(existingFido2),
       uris: await encryptUris(draft.loginUris || [], keys.enc, keys.mac),
     };
   } else if (type === 3) {
@@ -730,10 +1066,13 @@ export async function updateCipher(
       country: await encryptTextValue(draft.identCountry, keys.enc, keys.mac),
     };
   } else if (type === 5) {
+    const encryptedFingerprint = await encryptTextValue(draft.sshFingerprint, keys.enc, keys.mac);
     payload.sshKey = {
       privateKey: await encryptTextValue(draft.sshPrivateKey, keys.enc, keys.mac),
       publicKey: await encryptTextValue(draft.sshPublicKey, keys.enc, keys.mac),
-      fingerprint: await encryptTextValue(draft.sshFingerprint, keys.enc, keys.mac),
+      keyFingerprint: encryptedFingerprint,
+      // Keep legacy alias for backward compatibility with previously exported/edited items.
+      fingerprint: encryptedFingerprint,
     };
   } else if (type === 2) {
     payload.secureNote = { type: 0 };

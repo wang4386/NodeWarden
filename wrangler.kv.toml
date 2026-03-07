@@ -9,8 +9,7 @@ command = "npm run build"
 [[d1_databases]]
 binding = "DB"
 database_name = "nodewarden-db"
-database_id = "e02c11d6-f293-49c6-a593-77b3e2a9282d"
 
-[[r2_buckets]]
-binding = "ATTACHMENTS"
-bucket_name = "nodewarden-attachments"
+[[kv_namespaces]]
+binding = "ATTACHMENTS_KV"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"

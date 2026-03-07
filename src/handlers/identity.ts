@@ -13,22 +13,23 @@ import { issueSendAccessToken } from './sends';
 const TWO_FACTOR_REMEMBER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const TWO_FACTOR_PROVIDER_AUTHENTICATOR = 0;
 const TWO_FACTOR_PROVIDER_REMEMBER = 5;
-const TWO_FACTOR_PROVIDER_RECOVERY_CODE = 8;
+// Android client (2026.2.x) deserializes TwoFactorProviders2 keys with -1 for recovery code.
+// Keep request parsing backward-compatible with historical provider values (8 / 100).
+const TWO_FACTOR_PROVIDER_RECOVERY_CODE_RESPONSE = '-1';
+const TWO_FACTOR_PROVIDER_RECOVERY_CODE_LEGACY = 8;
+const TWO_FACTOR_PROVIDER_RECOVERY_CODE_ANDROID_REQUEST = 100;
 
-function resolveTotpSecret(userSecret: string | null, envSecret: string | undefined): string | null {
+function resolveTotpSecret(userSecret: string | null): string | null {
   if (userSecret && isTotpEnabled(userSecret)) {
     return userSecret;
-  }
-  if (isTotpEnabled(envSecret)) {
-    return envSecret!;
   }
   return null;
 }
 
 function twoFactorRequiredResponse(message: string = 'Two factor required.', includeRecoveryCode: boolean = false): Response {
   const providers = includeRecoveryCode
-    ? [TWO_FACTOR_PROVIDER_AUTHENTICATOR, TWO_FACTOR_PROVIDER_RECOVERY_CODE]
-    : [TWO_FACTOR_PROVIDER_AUTHENTICATOR];
+    ? [String(TWO_FACTOR_PROVIDER_AUTHENTICATOR), TWO_FACTOR_PROVIDER_RECOVERY_CODE_RESPONSE]
+    : [String(TWO_FACTOR_PROVIDER_AUTHENTICATOR)];
   const providers2: Record<string, null> = {};
   for (const provider of providers) providers2[provider] = null;
 
@@ -106,6 +107,9 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
 
   const grantType = body.grant_type;
   const clientIdentifier = getClientIdentifier(request);
+  if (!clientIdentifier) {
+    return identityErrorResponse('Client IP is required', 'invalid_request', 403);
+  }
 
   if (grantType === 'password') {
     // Login with password
@@ -151,9 +155,9 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       );
     }
 
-    // Optional 2FA: enabled per-user secret first, then falls back to global env secret for compatibility.
+    // Optional 2FA: enabled only by per-user secret.
     let trustedTwoFactorTokenToReturn: string | undefined;
-    const effectiveTotpSecret = resolveTotpSecret(user.totpSecret, env.TOTP_SECRET);
+    const effectiveTotpSecret = resolveTotpSecret(user.totpSecret);
     if (effectiveTotpSecret) {
       const canUseRecoveryCode = !!user.totpRecoveryCode;
       const normalizedTwoFactorProvider = String(twoFactorProvider ?? '').trim();
@@ -168,13 +172,8 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
         return twoFactorRequiredResponse('Two factor required.', canUseRecoveryCode);
       }
 
-      const parsedProvider = Number.parseInt(normalizedTwoFactorProvider, 10);
-      if (!Number.isFinite(parsedProvider)) {
-        return twoFactorRequiredResponse('Two factor required.', canUseRecoveryCode);
-      }
-
       let passedByRememberToken = false;
-      if (parsedProvider === TWO_FACTOR_PROVIDER_REMEMBER) {
+      if (normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_REMEMBER)) {
         if (deviceInfo.deviceIdentifier) {
           const trustedUserId = await storage.getTrustedTwoFactorDeviceTokenUserId(
             normalizedTwoFactorToken,
@@ -187,12 +186,16 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
         if (!passedByRememberToken) {
           return twoFactorRequiredResponse('Two factor required.', canUseRecoveryCode);
         }
-      } else if (parsedProvider === TWO_FACTOR_PROVIDER_AUTHENTICATOR) {
+      } else if (normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_AUTHENTICATOR)) {
         const totpOk = await verifyTotpToken(effectiveTotpSecret, normalizedTwoFactorToken);
         if (!totpOk) {
           return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
         }
-      } else if (parsedProvider === TWO_FACTOR_PROVIDER_RECOVERY_CODE) {
+      } else if (
+        normalizedTwoFactorProvider === TWO_FACTOR_PROVIDER_RECOVERY_CODE_RESPONSE ||
+        normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_RECOVERY_CODE_LEGACY) ||
+        normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_RECOVERY_CODE_ANDROID_REQUEST)
+      ) {
         if (!recoveryCodeEquals(normalizedTwoFactorToken, user.totpRecoveryCode)) {
           return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
         }
@@ -297,7 +300,14 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
     ).trim() || null;
     const password = String(body.password || '').trim() || null;
 
-    const result = await issueSendAccessToken(env, sendId, passwordHashB64, password);
+    const result = await issueSendAccessToken(
+      env,
+      sendId,
+      passwordHashB64,
+      password,
+      rateLimit,
+      `${clientIdentifier}:send-password`
+    );
     if ('error' in result) {
       return result.error;
     }
@@ -310,6 +320,18 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       unofficialServer: true,
     });
   } else if (grantType === 'refresh_token') {
+    const refreshLimit = await rateLimit.consumeBudget(
+      `${clientIdentifier}:identity-refresh`,
+      LIMITS.rateLimit.refreshTokenRequestsPerMinute
+    );
+    if (!refreshLimit.allowed) {
+      return identityErrorResponse(
+        `Rate limit exceeded. Try again in ${refreshLimit.retryAfterSeconds} seconds.`,
+        'TooManyRequests',
+        429
+      );
+    }
+
     // Refresh token
     const refreshToken = body.refresh_token;
     if (!refreshToken) {

@@ -4,7 +4,6 @@ import { errorResponse } from '../utils/response';
 import { cipherToResponse } from './ciphers';
 import { sendToResponse } from './sends';
 import { LIMITS } from '../config/limits';
-import { isTotpEnabled } from '../utils/totp';
 
 interface SyncCacheEntry {
   body: string;
@@ -76,7 +75,7 @@ export async function handleSync(request: Request, env: Env, userId: string): Pr
     usesKeyConnector: false,
     masterPasswordHint: null,
     culture: 'en-US',
-    twoFactorEnabled: !!user.totpSecret || isTotpEnabled(env.TOTP_SECRET),
+    twoFactorEnabled: !!user.totpSecret,
     key: user.key,
     privateKey: user.privateKey,
     accountKeys: null,

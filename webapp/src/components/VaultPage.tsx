@@ -6,6 +6,7 @@ import {
   CheckCheck,
   Clipboard,
   CreditCard,
+  Download,
   Eye,
   EyeOff,
   ExternalLink,
@@ -17,6 +18,7 @@ import {
   Globe,
   KeyRound,
   LayoutGrid,
+  Paperclip,
   Pencil,
   Plus,
   RefreshCw,
@@ -25,9 +27,10 @@ import {
   StarOff,
   StickyNote,
   Trash2,
+  Upload,
   X,
 } from 'lucide-preact';
-import type { Cipher, CustomFieldType, Folder, VaultDraft, VaultDraftField } from '@/lib/types';
+import type { Cipher, CipherAttachment, CustomFieldType, Folder, VaultDraft, VaultDraftField } from '@/lib/types';
 import { t } from '@/lib/i18n';
 
 interface VaultPageProps {
@@ -36,14 +39,16 @@ interface VaultPageProps {
   loading: boolean;
   emailForReprompt: string;
   onRefresh: () => Promise<void>;
-  onCreate: (draft: VaultDraft) => Promise<void>;
-  onUpdate: (cipher: Cipher, draft: VaultDraft) => Promise<void>;
+  onCreate: (draft: VaultDraft, attachments?: File[]) => Promise<void>;
+  onUpdate: (cipher: Cipher, draft: VaultDraft, options?: { addFiles?: File[]; removeAttachmentIds?: string[] }) => Promise<void>;
   onDelete: (cipher: Cipher) => Promise<void>;
   onBulkDelete: (ids: string[]) => Promise<void>;
   onBulkMove: (ids: string[], folderId: string | null) => Promise<void>;
   onVerifyMasterPassword: (email: string, password: string) => Promise<void>;
   onNotify: (type: 'success' | 'error', text: string) => void;
   onCreateFolder: (name: string) => Promise<void>;
+  onDeleteFolder: (folderId: string) => Promise<void>;
+  onDownloadAttachment: (cipher: Cipher, attachmentId: string) => Promise<void>;
 }
 
 type TypeFilter = 'login' | 'card' | 'identity' | 'note' | 'ssh';
@@ -158,6 +163,7 @@ function createEmptyDraft(type: number): VaultDraft {
     loginPassword: '',
     loginTotp: '',
     loginUris: [''],
+    loginFido2Credentials: [],
     cardholderName: '',
     cardNumber: '',
     cardBrand: '',
@@ -203,6 +209,9 @@ function draftFromCipher(cipher: Cipher): VaultDraft {
     draft.loginPassword = cipher.login.decPassword || '';
     draft.loginTotp = cipher.login.decTotp || '';
     draft.loginUris = (cipher.login.uris || []).map((x) => x.decUri || x.uri || '');
+    draft.loginFido2Credentials = Array.isArray(cipher.login.fido2Credentials)
+      ? cipher.login.fido2Credentials.map((credential) => ({ ...credential }))
+      : [];
     if (!draft.loginUris.length) draft.loginUris = [''];
   }
   if (cipher.card) {
@@ -262,6 +271,35 @@ function formatHistoryTime(value: string | null | undefined): string {
   const date = new Date(value);
   if (!Number.isFinite(date.getTime())) return value;
   return date.toLocaleString();
+}
+
+function parseAttachmentSizeBytes(attachment: CipherAttachment): number {
+  const raw = attachment?.size;
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0) return raw;
+  const parsed = Number(raw);
+  if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  return 0;
+}
+
+function formatAttachmentSize(attachment: CipherAttachment): string {
+  const sizeName = String(attachment?.sizeName || '').trim();
+  if (sizeName) return sizeName;
+  const bytes = parseAttachmentSizeBytes(attachment);
+  if (bytes <= 0) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function firstPasskeyCreationTime(cipher: Cipher | null): string | null {
+  const credentials = cipher?.login?.fido2Credentials;
+  if (!Array.isArray(credentials) || credentials.length === 0) return null;
+  for (const credential of credentials) {
+    const raw = String(credential?.creationDate || '').trim();
+    if (raw) return raw;
+  }
+  return null;
 }
 
 const TOTP_PERIOD_SECONDS = 30;
@@ -325,13 +363,17 @@ export default function VaultPage(props: VaultPageProps) {
   const [moveFolderId, setMoveFolderId] = useState('__none__');
   const [createFolderOpen, setCreateFolderOpen] = useState(false);
   const [newFolderName, setNewFolderName] = useState('');
+  const [pendingDeleteFolder, setPendingDeleteFolder] = useState<Folder | null>(null);
   const [totpLive, setTotpLive] = useState<{ code: string; remain: number } | null>(null);
   const [hiddenFieldVisibleMap, setHiddenFieldVisibleMap] = useState<Record<number, boolean>>({});
+  const [attachmentQueue, setAttachmentQueue] = useState<File[]>([]);
+  const [removedAttachmentIds, setRemovedAttachmentIds] = useState<Record<string, boolean>>({});
   const [busy, setBusy] = useState(false);
   const [repromptOpen, setRepromptOpen] = useState(false);
   const [repromptPassword, setRepromptPassword] = useState('');
   const [repromptApprovedCipherId, setRepromptApprovedCipherId] = useState<string | null>(null);
   const createMenuRef = useRef<HTMLDivElement | null>(null);
+  const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const sshSeedTicketRef = useRef(0);
   const sshFingerprintTicketRef = useRef(0);
 
@@ -419,6 +461,20 @@ export default function VaultPage(props: VaultPageProps) {
     () => props.ciphers.find((x) => x.id === selectedCipherId) || null,
     [props.ciphers, selectedCipherId]
   );
+  const passkeyCreatedAt = firstPasskeyCreationTime(selectedCipher);
+  const selectedAttachments = useMemo(
+    () => (Array.isArray(selectedCipher?.attachments) ? selectedCipher.attachments : []),
+    [selectedCipher]
+  );
+  const editExistingAttachments = useMemo(
+    () =>
+      selectedAttachments.filter((attachment) => {
+        const id = String(attachment?.id || '').trim();
+        return !!id;
+      }),
+    [selectedAttachments]
+  );
+  const removedAttachmentCount = useMemo(() => Object.values(removedAttachmentIds).filter(Boolean).length, [removedAttachmentIds]);
 
   useEffect(() => {
     const raw = selectedCipher?.login?.decTotp || '';
@@ -470,6 +526,8 @@ function folderName(id: string | null | undefined): string {
     setSelectedCipherId('');
     setShowPassword(false);
     setLocalError('');
+    setAttachmentQueue([]);
+    setRemovedAttachmentIds({});
     if (type === 5) void seedSshDefaults();
   }
 
@@ -480,6 +538,8 @@ function folderName(id: string | null | undefined): string {
     setIsEditing(true);
     setShowPassword(false);
     setLocalError('');
+    setAttachmentQueue([]);
+    setRemovedAttachmentIds({});
   }
 
   function cancelEdit(): void {
@@ -487,6 +547,8 @@ function folderName(id: string | null | undefined): string {
     setIsEditing(false);
     setIsCreating(false);
     setLocalError('');
+    setAttachmentQueue([]);
+    setRemovedAttachmentIds({});
   }
 
   function updateDraft(patch: Partial<VaultDraft>): void {
@@ -555,6 +617,28 @@ function folderName(id: string | null | undefined): string {
     });
   }
 
+  function queueAttachmentFiles(list: FileList | null): void {
+    if (!list || !list.length) return;
+    const next = Array.from(list).filter((file) => file && file.size >= 0);
+    if (!next.length) return;
+    setAttachmentQueue((prev) => [...prev, ...next]);
+  }
+
+  function removeQueuedAttachment(index: number): void {
+    setAttachmentQueue((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  function toggleExistingAttachmentRemoval(attachmentId: string): void {
+    const id = String(attachmentId || '').trim();
+    if (!id) return;
+    setRemovedAttachmentIds((prev) => {
+      const next = { ...prev };
+      if (next[id]) delete next[id];
+      else next[id] = true;
+      return next;
+    });
+  }
+
   async function saveDraft(): Promise<void> {
     if (!draft) return;
     let nextDraft = draft;
@@ -572,14 +656,20 @@ function folderName(id: string | null | undefined): string {
     setBusy(true);
     try {
       if (isCreating) {
-        await props.onCreate(nextDraft);
+        await props.onCreate(nextDraft, attachmentQueue);
       } else if (selectedCipher) {
-        await props.onUpdate(selectedCipher, nextDraft);
+        const removeAttachmentIds = Object.keys(removedAttachmentIds).filter((id) => !!removedAttachmentIds[id]);
+        await props.onUpdate(selectedCipher, nextDraft, {
+          addFiles: attachmentQueue,
+          removeAttachmentIds,
+        });
       }
       setIsCreating(false);
       setIsEditing(false);
       setDraft(null);
       setLocalError('');
+      setAttachmentQueue([]);
+      setRemovedAttachmentIds({});
     } finally {
       setBusy(false);
     }
@@ -671,6 +761,20 @@ function folderName(id: string | null | undefined): string {
     }
   }
 
+  async function confirmDeleteFolder(): Promise<void> {
+    if (!pendingDeleteFolder) return;
+    setBusy(true);
+    try {
+      await props.onDeleteFolder(pendingDeleteFolder.id);
+      if (sidebarFilter.kind === 'folder' && sidebarFilter.folderId === pendingDeleteFolder.id) {
+        setSidebarFilter({ kind: 'all' });
+      }
+      setPendingDeleteFolder(null);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <>
       <div className="vault-grid">
@@ -717,17 +821,32 @@ function folderName(id: string | null | undefined): string {
               <FolderX size={14} className="tree-icon" /> <span className="tree-label">{t('txt_no_folder')}</span>
             </button>
             {props.folders.map((folder) => (
-              <button
-                key={folder.id}
-                type="button"
-                className={`tree-btn ${sidebarFilter.kind === 'folder' && sidebarFilter.folderId === folder.id ? 'active' : ''}`}
-                onClick={() => setSidebarFilter({ kind: 'folder', folderId: folder.id })}
-              >
-                <FolderIcon size={14} className="tree-icon" />
-                <span className="tree-label" title={folder.decName || folder.name || folder.id}>
-                  {folder.decName || folder.name || folder.id}
-                </span>
-              </button>
+              <div key={folder.id} className="folder-row">
+                <button
+                  type="button"
+                  className={`tree-btn ${sidebarFilter.kind === 'folder' && sidebarFilter.folderId === folder.id ? 'active' : ''}`}
+                  onClick={() => setSidebarFilter({ kind: 'folder', folderId: folder.id })}
+                >
+                  <FolderIcon size={14} className="tree-icon" />
+                  <span className="tree-label" title={folder.decName || folder.name || folder.id}>
+                    {folder.decName || folder.name || folder.id}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  className="folder-delete-btn"
+                  title={t('txt_delete')}
+                  aria-label={t('txt_delete')}
+                  disabled={busy}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setPendingDeleteFolder(folder);
+                  }}
+                >
+                  <X size={12} />
+                </button>
+              </div>
             ))}
           </div>
         </aside>
@@ -818,6 +937,9 @@ function folderName(id: string | null | undefined): string {
                   type="button"
                   className="row-main"
                   onClick={() => {
+                    if (isEditing || isCreating) {
+                      cancelEdit();
+                    }
                     setSelectedCipherId(cipher.id);
                     setRepromptApprovedCipherId(null);
                   }}
@@ -841,7 +963,7 @@ function folderName(id: string | null | undefined): string {
             <>
               <div className="card">
                 <div className="section-head">
-                  <h3 className="detail-title">{isCreating ? `New ${cipherTypeLabel(draft.type)}` : `Edit ${cipherTypeLabel(draft.type)}`}</h3>
+                  <h3 className="detail-title">{isCreating ? t('txt_new_type_header', { type: cipherTypeLabel(draft.type) }) : t('txt_edit_type_header', { type: cipherTypeLabel(draft.type) })}</h3>
                   <button
                     type="button"
                     className={`btn btn-secondary small ${draft.favorite ? 'star-on' : ''}`}
@@ -925,6 +1047,7 @@ function folderName(id: string | null | undefined): string {
                           className="btn btn-secondary small"
                           onClick={() => updateDraft({ loginUris: draft.loginUris.filter((_, i) => i !== index) })}
                         >
+                          <X size={14} className="btn-icon" />
                           {t('txt_remove')}
                         </button>
                       )}
@@ -1014,6 +1137,104 @@ function folderName(id: string | null | undefined): string {
               )}
 
               <div className="card">
+                <div className="section-head attachment-head">
+                  <h4>{t('txt_attachments')}</h4>
+                  <button
+                    type="button"
+                    className="btn btn-secondary small attachment-add-btn"
+                    disabled={busy}
+                    onClick={() => attachmentInputRef.current?.click()}
+                    title={t('txt_upload_attachments')}
+                    aria-label={t('txt_upload_attachments')}
+                  >
+                    <Plus size={14} className="btn-icon" />
+                  </button>
+                </div>
+                {!isCreating && selectedCipher && editExistingAttachments.length > 0 && (
+                  <div className="attachment-list">
+                    {editExistingAttachments.map((attachment) => {
+                      const attachmentId = String(attachment?.id || '').trim();
+                      if (!attachmentId) return null;
+                      const removed = !!removedAttachmentIds[attachmentId];
+                      const fileName = String(attachment.decFileName || attachment.fileName || attachmentId).trim() || attachmentId;
+                      return (
+                        <div key={`edit-attachment-${attachmentId}`} className={`attachment-row ${removed ? 'is-removed' : ''}`}>
+                          <div className="attachment-main">
+                            <Paperclip size={14} />
+                            <div className="attachment-text">
+                              <strong className="value-ellipsis" title={fileName}>{fileName}</strong>
+                              <span>{formatAttachmentSize(attachment)}</span>
+                            </div>
+                          </div>
+                          <div className="kv-actions">
+                            <button
+                              type="button"
+                              className="btn btn-secondary small"
+                              disabled={busy || removed}
+                              onClick={() => void props.onDownloadAttachment(selectedCipher, attachmentId)}
+                            >
+                              <Download size={14} className="btn-icon" /> {t('txt_download')}
+                            </button>
+                            <button
+                              type="button"
+                              className="btn btn-secondary small"
+                              disabled={busy}
+                              onClick={() => toggleExistingAttachmentRemoval(attachmentId)}
+                            >
+                              <X size={14} className="btn-icon" />
+                              {removed ? t('txt_cancel') : t('txt_remove')}
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {!!removedAttachmentCount && (
+                  <div className="detail-sub">{t('txt_marked_for_removal_count', { count: removedAttachmentCount })}</div>
+                )}
+                <input
+                  ref={attachmentInputRef}
+                  type="file"
+                  className="attachment-file-input"
+                  multiple
+                  disabled={busy}
+                  onChange={(e) => {
+                    const input = e.currentTarget as HTMLInputElement;
+                    queueAttachmentFiles(input.files);
+                    input.value = '';
+                  }}
+                />
+                {!!attachmentQueue.length && (
+                  <div className="attachment-list">
+                    <div className="attachment-queue-title">{t('txt_new_attachments')}</div>
+                    {attachmentQueue.map((file, index) => (
+                      <div key={`queued-attachment-${index}-${file.name}`} className="attachment-row">
+                        <div className="attachment-main">
+                          <Upload size={14} />
+                          <div className="attachment-text">
+                            <strong className="value-ellipsis" title={file.name}>{file.name}</strong>
+                            <span>{formatAttachmentSize({ size: file.size })}</span>
+                          </div>
+                        </div>
+                        <div className="kv-actions">
+                          <button
+                            type="button"
+                            className="btn btn-secondary small"
+                            disabled={busy}
+                            onClick={() => removeQueuedAttachment(index)}
+                          >
+                            <X size={14} className="btn-icon" />
+                            {t('txt_remove')}
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="card">
                 <h4>{t('txt_additional_options')}</h4>
                 <label className="field">
                   <span>{t('txt_notes')}</span>
@@ -1059,6 +1280,7 @@ function folderName(id: string | null | undefined): string {
                       className="btn btn-secondary small"
                       onClick={() => updateDraftCustomFields(draft.customFields.filter((_, i) => i !== originalIndex))}
                     >
+                      <X size={14} className="btn-icon" />
                       {t('txt_remove')}
                     </button>
                   </div>
@@ -1068,14 +1290,17 @@ function folderName(id: string | null | undefined): string {
               <div className="detail-actions">
                 <div className="actions">
                   <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void saveDraft()}>
+                    <CheckCheck size={14} className="btn-icon" />
                     {t('txt_confirm')}
                   </button>
                   <button type="button" className="btn btn-secondary" disabled={busy} onClick={cancelEdit}>
+                    <X size={14} className="btn-icon" />
                     {t('txt_cancel')}
                   </button>
                 </div>
                 {!isCreating && selectedCipher && (
                   <button type="button" className="btn btn-danger" disabled={busy} onClick={() => setPendingDelete(selectedCipher)}>
+                    <Trash2 size={14} className="btn-icon" />
                     {t('txt_delete')}
                   </button>
                 )}
@@ -1172,6 +1397,15 @@ function folderName(id: string | null | undefined): string {
                       </div>
                     </div>
                   )}
+                  {!!passkeyCreatedAt && (
+                    <div className="kv-row">
+                      <span className="kv-label">{t('txt_passkey')}</span>
+                      <div className="kv-main">
+                        <strong>{t('txt_passkey_created_at_value', { value: formatHistoryTime(passkeyCreatedAt) })}</strong>
+                      </div>
+                      <div className="kv-actions" />
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -1227,9 +1461,33 @@ function folderName(id: string | null | undefined): string {
               {selectedCipher.sshKey && (
                 <div className="card">
                   <h4>{t('txt_ssh_key')}</h4>
-                  <div className="kv-line"><span>{t('txt_private_key')}</span><strong>{maskSecret(selectedCipher.sshKey.decPrivateKey || '')}</strong></div>
-                  <div className="kv-line"><span>{t('txt_public_key')}</span><strong>{selectedCipher.sshKey.decPublicKey || ''}</strong></div>
-                  <div className="kv-line"><span>{t('txt_fingerprint')}</span><strong>{selectedCipher.sshKey.decFingerprint || ''}</strong></div>
+                  <div className="kv-row">
+                    <span className="kv-label">{t('txt_private_key')}</span>
+                    <div className="kv-main">
+                      <strong className="value-ellipsis" title={maskSecret(selectedCipher.sshKey.decPrivateKey || '')}>
+                        {maskSecret(selectedCipher.sshKey.decPrivateKey || '')}
+                      </strong>
+                    </div>
+                    <div className="kv-actions" />
+                  </div>
+                  <div className="kv-row">
+                    <span className="kv-label">{t('txt_public_key')}</span>
+                    <div className="kv-main">
+                      <strong className="value-ellipsis" title={selectedCipher.sshKey.decPublicKey || ''}>
+                        {selectedCipher.sshKey.decPublicKey || ''}
+                      </strong>
+                    </div>
+                    <div className="kv-actions" />
+                  </div>
+                  <div className="kv-row">
+                    <span className="kv-label">{t('txt_fingerprint')}</span>
+                    <div className="kv-main">
+                      <strong className="value-ellipsis" title={selectedCipher.sshKey.decFingerprint || ''}>
+                        {selectedCipher.sshKey.decFingerprint || ''}
+                      </strong>
+                    </div>
+                    <div className="kv-actions" />
+                  </div>
                 </div>
               )}
 
@@ -1293,6 +1551,39 @@ function folderName(id: string | null | undefined): string {
                         </div>
                       );
                     })}
+                </div>
+              )}
+
+              {selectedAttachments.some((attachment) => String(attachment?.id || '').trim()) && (
+                <div className="card">
+                  <h4>{t('txt_attachments')}</h4>
+                  <div className="attachment-list">
+                    {selectedAttachments.map((attachment) => {
+                      const attachmentId = String(attachment?.id || '').trim();
+                      if (!attachmentId) return null;
+                      const fileName = String(attachment.decFileName || attachment.fileName || attachmentId).trim() || attachmentId;
+                      return (
+                        <div key={`view-attachment-${attachmentId}`} className="attachment-row">
+                          <div className="attachment-main">
+                            <Paperclip size={14} />
+                            <div className="attachment-text">
+                              <strong className="value-ellipsis" title={fileName}>{fileName}</strong>
+                              <span>{formatAttachmentSize(attachment)}</span>
+                            </div>
+                          </div>
+                          <div className="kv-actions">
+                            <button
+                              type="button"
+                              className="btn btn-secondary small"
+                              onClick={() => void props.onDownloadAttachment(selectedCipher, attachmentId)}
+                            >
+                              <Download size={14} className="btn-icon" /> {t('txt_download')}
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
               )}
 
@@ -1444,6 +1735,17 @@ function folderName(id: string | null | undefined): string {
           <input className="input" value={newFolderName} onInput={(e) => setNewFolderName((e.currentTarget as HTMLInputElement).value)} />
         </label>
       </ConfirmDialog>
+
+      <ConfirmDialog
+        open={!!pendingDeleteFolder}
+        title={t('txt_delete_folder')}
+        message={t('txt_delete_folder_message', { name: pendingDeleteFolder?.decName || pendingDeleteFolder?.name || pendingDeleteFolder?.id || '' })}
+        confirmText={t('txt_delete')}
+        cancelText={t('txt_cancel')}
+        danger
+        onConfirm={() => void confirmDeleteFolder()}
+        onCancel={() => setPendingDeleteFolder(null)}
+      />
 
       <ConfirmDialog
         open={repromptOpen}

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Link, Route, Switch, useLocation } from 'wouter';
 import { useQuery } from '@tanstack/react-query';
 import { ArrowUpDown, Cloud, Lock, LogOut, Send as SendIcon, Settings as SettingsIcon, Shield, ShieldUser, Vault } from 'lucide-preact';
@@ -14,22 +14,30 @@ import SettingsPage from '@/components/SettingsPage';
 import SecurityDevicesPage from '@/components/SecurityDevicesPage';
 import AdminPage from '@/components/AdminPage';
 import HelpPage from '@/components/HelpPage';
-import ImportExportPage from '@/components/ImportExportPage';
+import ImportPage from '@/components/ImportPage';
+import type { ImportAttachmentFile, ImportResultSummary } from '@/components/ImportPage';
 import {
   changeMasterPassword,
   createFolder,
+  updateFolder,
+  deleteCipherAttachment,
+  deleteFolder,
   createCipher,
   createAuthedFetch,
   createInvite,
+  downloadCipherAttachmentDecrypted,
+  importCiphers,
   createSend,
   deleteAllInvites,
   deleteCipher,
   deleteSend,
   deleteUser,
   deriveLoginHash,
+  getAttachmentDownloadInfo,
   bulkMoveCiphers,
   getCiphers,
   getFolders,
+  getPreloginKdfConfig,
   getProfile,
   getAuthorizedDevices,
   getSetupStatus,
@@ -50,14 +58,30 @@ import {
   setTotp,
   setUserStatus,
   deleteAuthorizedDevice,
+  uploadCipherAttachment,
   updateCipher,
   updateSend,
   buildSendShareKey,
   unlockVaultKey,
   verifyMasterPassword,
+  type ImportedCipherMapEntry,
 } from '@/lib/api';
-import { base64ToBytes, decryptBw, decryptStr, hkdf } from '@/lib/crypto';
+import { base64ToBytes, decryptBw, decryptBwFileData, decryptStr, hkdf } from '@/lib/crypto';
+import {
+  attachNodeWardenEncryptedAttachmentPayload,
+  buildAccountEncryptedBitwardenJsonString,
+  buildBitwardenZipBytes,
+  buildExportFileName,
+  buildNodeWardenAttachmentRecords,
+  buildNodeWardenPlainJsonDocument,
+  buildPasswordProtectedBitwardenJsonString,
+  buildPlainBitwardenJsonString,
+  encryptZipBytesWithPassword,
+  type ExportRequest,
+  type ZipAttachmentEntry,
+} from '@/lib/export-formats';
 import { t } from '@/lib/i18n';
+import type { CiphersImportPayload } from '@/lib/api';
 import type { AppPhase, AuthorizedDevice, Cipher, Folder, Profile, Send, SendDraft, SessionState, ToastMessage, VaultDraft } from '@/lib/types';
 
 interface PendingTotp {
@@ -70,6 +94,171 @@ type JwtUnsafeReason = 'missing' | 'default' | 'too_short';
 
 const SEND_KEY_SALT = 'bitwarden-send';
 const SEND_KEY_PURPOSE = 'send';
+const IMPORT_ROUTE = '/help/import-export';
+const IMPORT_ROUTE_ALIASES = new Set(['/tools/import', '/tools/import-export', '/tools/import-data', '/import', '/import-export']);
+
+function looksLikeCipherString(value: string): boolean {
+  return /^\d+\.[A-Za-z0-9+/=]+\|[A-Za-z0-9+/=]+(?:\|[A-Za-z0-9+/=]+)?$/.test(String(value || '').trim());
+}
+
+function asText(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  return String(value);
+}
+
+function summarizeImportResult(
+  ciphers: Array<Record<string, unknown>>,
+  folderCount: number
+): ImportResultSummary {
+  const typeLabel = (type: number): string => {
+    if (type === 1) return t('txt_login');
+    if (type === 2) return t('txt_secure_note');
+    if (type === 3) return t('txt_card');
+    if (type === 4) return t('txt_identity');
+    if (type === 5) return t('txt_ssh_key');
+    return t('txt_other');
+  };
+  const counter = new Map<number, number>();
+  for (const raw of ciphers) {
+    const cipherType = Number(raw?.type || 1) || 1;
+    counter.set(cipherType, (counter.get(cipherType) || 0) + 1);
+  }
+  const order = [1, 2, 3, 4, 5];
+  const seen = new Set<number>(order);
+  const typeCounts = order
+    .filter((type) => (counter.get(type) || 0) > 0)
+    .map((type) => ({ label: typeLabel(type), count: counter.get(type) || 0 }));
+  for (const [type, count] of counter.entries()) {
+    if (!seen.has(type) && count > 0) typeCounts.push({ label: typeLabel(type), count });
+  }
+  return {
+    totalItems: ciphers.length,
+    folderCount: Math.max(0, folderCount),
+    typeCounts,
+  };
+}
+
+function buildEmptyImportDraft(type: number): VaultDraft {
+  return {
+    type,
+    favorite: false,
+    name: '',
+    folderId: '',
+    notes: '',
+    reprompt: false,
+    loginUsername: '',
+    loginPassword: '',
+    loginTotp: '',
+    loginUris: [''],
+    loginFido2Credentials: [],
+    cardholderName: '',
+    cardNumber: '',
+    cardBrand: '',
+    cardExpMonth: '',
+    cardExpYear: '',
+    cardCode: '',
+    identTitle: '',
+    identFirstName: '',
+    identMiddleName: '',
+    identLastName: '',
+    identUsername: '',
+    identCompany: '',
+    identSsn: '',
+    identPassportNumber: '',
+    identLicenseNumber: '',
+    identEmail: '',
+    identPhone: '',
+    identAddress1: '',
+    identAddress2: '',
+    identAddress3: '',
+    identCity: '',
+    identState: '',
+    identPostalCode: '',
+    identCountry: '',
+    sshPrivateKey: '',
+    sshPublicKey: '',
+    sshFingerprint: '',
+    customFields: [],
+  };
+}
+
+function importCipherToDraft(cipher: Record<string, unknown>, folderId: string | null): VaultDraft {
+  const type = Number(cipher.type || 1) || 1;
+  const draft = buildEmptyImportDraft(type);
+  draft.name = asText(cipher.name).trim() || 'Untitled';
+  draft.notes = asText(cipher.notes);
+  draft.favorite = !!cipher.favorite;
+  draft.reprompt = Number(cipher.reprompt || 0) === 1;
+  draft.folderId = folderId || '';
+
+  const customFieldsRaw = Array.isArray(cipher.fields) ? cipher.fields : [];
+  draft.customFields = customFieldsRaw
+    .map((raw) => {
+      const field = (raw || {}) as Record<string, unknown>;
+      const label = asText(field.name).trim();
+      if (!label) return null;
+      const parsedType = Number(field.type ?? 0);
+      const fieldType = parsedType === 1 || parsedType === 2 || parsedType === 3 ? (parsedType as 1 | 2 | 3) : 0;
+      return {
+        type: fieldType,
+        label,
+        value: asText(field.value),
+      };
+    })
+    .filter((x): x is VaultDraft['customFields'][number] => !!x);
+
+  if (type === 1) {
+    const login = (cipher.login || {}) as Record<string, unknown>;
+    draft.loginUsername = asText(login.username);
+    draft.loginPassword = asText(login.password);
+    draft.loginTotp = asText(login.totp);
+    draft.loginFido2Credentials = Array.isArray(login.fido2Credentials)
+      ? login.fido2Credentials
+          .filter((credential): credential is Record<string, unknown> => !!credential && typeof credential === 'object')
+          .map((credential) => ({ ...credential }))
+      : [];
+    const urisRaw = Array.isArray(login.uris) ? login.uris : [];
+    const uris = urisRaw
+      .map((u) => asText((u as Record<string, unknown>)?.uri).trim())
+      .filter((u) => !!u);
+    draft.loginUris = uris.length ? uris : [''];
+  } else if (type === 3) {
+    const card = (cipher.card || {}) as Record<string, unknown>;
+    draft.cardholderName = asText(card.cardholderName);
+    draft.cardNumber = asText(card.number);
+    draft.cardBrand = asText(card.brand);
+    draft.cardExpMonth = asText(card.expMonth);
+    draft.cardExpYear = asText(card.expYear);
+    draft.cardCode = asText(card.code);
+  } else if (type === 4) {
+    const identity = (cipher.identity || {}) as Record<string, unknown>;
+    draft.identTitle = asText(identity.title);
+    draft.identFirstName = asText(identity.firstName);
+    draft.identMiddleName = asText(identity.middleName);
+    draft.identLastName = asText(identity.lastName);
+    draft.identUsername = asText(identity.username);
+    draft.identCompany = asText(identity.company);
+    draft.identSsn = asText(identity.ssn);
+    draft.identPassportNumber = asText(identity.passportNumber);
+    draft.identLicenseNumber = asText(identity.licenseNumber);
+    draft.identEmail = asText(identity.email);
+    draft.identPhone = asText(identity.phone);
+    draft.identAddress1 = asText(identity.address1);
+    draft.identAddress2 = asText(identity.address2);
+    draft.identAddress3 = asText(identity.address3);
+    draft.identCity = asText(identity.city);
+    draft.identState = asText(identity.state);
+    draft.identPostalCode = asText(identity.postalCode);
+    draft.identCountry = asText(identity.country);
+  } else if (type === 5) {
+    const sshKey = (cipher.sshKey || {}) as Record<string, unknown>;
+    draft.sshPrivateKey = asText(sshKey.privateKey);
+    draft.sshPublicKey = asText(sshKey.publicKey);
+    draft.sshFingerprint = asText(sshKey.keyFingerprint ?? sshKey.fingerprint);
+  }
+
+  return draft;
+}
 
 function buildPublicSendUrl(origin: string, accessId: string, keyPart: string): string {
   return `${origin}/#/send/${accessId}/${keyPart}`;
@@ -121,6 +310,7 @@ export default function App() {
   const [decryptedFolders, setDecryptedFolders] = useState<Folder[]>([]);
   const [decryptedCiphers, setDecryptedCiphers] = useState<Cipher[]>([]);
   const [decryptedSends, setDecryptedSends] = useState<Send[]>([]);
+  const migratedPlainFolderIdsRef = useRef<Set<string>>(new Set());
 
   function setSession(next: SessionState | null) {
     setSessionState(next);
@@ -470,6 +660,9 @@ export default function App() {
                 decUsername: await decryptField(cipher.login.username || '', itemEnc, itemMac),
                 decPassword: await decryptField(cipher.login.password || '', itemEnc, itemMac),
                 decTotp: await decryptField(cipher.login.totp || '', itemEnc, itemMac),
+                fido2Credentials: Array.isArray(cipher.login.fido2Credentials)
+                  ? cipher.login.fido2Credentials.map((credential) => ({ ...credential }))
+                  : null,
                 uris: await Promise.all(
                   (cipher.login.uris || []).map(async (u) => ({
                     ...u,
@@ -513,11 +706,14 @@ export default function App() {
               };
             }
             if (cipher.sshKey) {
+              const encryptedFingerprint = cipher.sshKey.keyFingerprint || cipher.sshKey.fingerprint || '';
               nextCipher.sshKey = {
                 ...cipher.sshKey,
                 decPrivateKey: await decryptField(cipher.sshKey.privateKey || '', itemEnc, itemMac),
                 decPublicKey: await decryptField(cipher.sshKey.publicKey || '', itemEnc, itemMac),
-                decFingerprint: await decryptField(cipher.sshKey.fingerprint || '', itemEnc, itemMac),
+                keyFingerprint: encryptedFingerprint || null,
+                fingerprint: encryptedFingerprint || null,
+                decFingerprint: await decryptField(encryptedFingerprint, itemEnc, itemMac),
               };
             }
             if (cipher.fields) {
@@ -526,6 +722,14 @@ export default function App() {
                   ...field,
                   decName: await decryptField(field.name || '', itemEnc, itemMac),
                   decValue: await decryptField(field.value || '', itemEnc, itemMac),
+                }))
+              );
+            }
+            if (Array.isArray(cipher.attachments)) {
+              nextCipher.attachments = await Promise.all(
+                cipher.attachments.map(async (attachment) => ({
+                  ...attachment,
+                  decFileName: await decryptField(attachment.fileName || '', itemEnc, itemMac),
                 }))
               );
             }
@@ -580,6 +784,31 @@ export default function App() {
     };
   }, [session?.symEncKey, session?.symMacKey, foldersQuery.data, ciphersQuery.data, sendsQuery.data]);
 
+  useEffect(() => {
+    if (!session?.symEncKey || !session?.symMacKey || !foldersQuery.data?.length) return;
+    let cancelled = false;
+    (async () => {
+      const pending = foldersQuery.data.filter((folder) => {
+        if (!folder?.id || !folder?.name) return false;
+        if (migratedPlainFolderIdsRef.current.has(folder.id)) return false;
+        return !looksLikeCipherString(String(folder.name));
+      });
+      if (!pending.length) return;
+      for (const folder of pending) {
+        try {
+          await updateFolder(authedFetch, session, folder.id, String(folder.name));
+          migratedPlainFolderIdsRef.current.add(folder.id);
+        } catch {
+          // keep silent; web still supports plaintext fallback display
+        }
+      }
+      if (!cancelled) await foldersQuery.refetch();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [session?.symEncKey, session?.symMacKey, foldersQuery.data, authedFetch]);
+
   async function changePasswordAction(currentPassword: string, nextPassword: string, nextPassword2: string) {
     if (!profile) return;
     if (!currentPassword || !nextPassword) {
@@ -611,14 +840,16 @@ export default function App() {
 
   async function enableTotpAction(secret: string, token: string) {
     if (!secret.trim() || !token.trim()) {
-      pushToast('error', t('txt_secret_and_code_are_required'));
-      return;
+      const error = new Error(t('txt_secret_and_code_are_required'));
+      pushToast('error', error.message);
+      throw error;
     }
     try {
       await setTotp(authedFetch, { enabled: true, secret: secret.trim(), token: token.trim() });
       pushToast('success', t('txt_totp_enabled'));
     } catch (error) {
       pushToast('error', error instanceof Error ? error.message : t('txt_enable_totp_failed'));
+      throw error;
     }
   }
 
@@ -668,10 +899,13 @@ export default function App() {
     pushToast('success', t('txt_device_removed'));
   }
 
-  async function createVaultItem(draft: VaultDraft) {
+  async function createVaultItem(draft: VaultDraft, attachments: File[] = []) {
     if (!session) return;
     try {
-      await createCipher(authedFetch, session, draft);
+      const created = await createCipher(authedFetch, session, draft);
+      for (const file of attachments) {
+        await uploadCipherAttachment(authedFetch, session, created.id, file);
+      }
       await Promise.all([ciphersQuery.refetch(), foldersQuery.refetch()]);
       pushToast('success', t('txt_item_created'));
     } catch (error) {
@@ -680,14 +914,51 @@ export default function App() {
     }
   }
 
-  async function updateVaultItem(cipher: Cipher, draft: VaultDraft) {
+  async function updateVaultItem(
+    cipher: Cipher,
+    draft: VaultDraft,
+    options?: { addFiles?: File[]; removeAttachmentIds?: string[] }
+  ) {
     if (!session) return;
+    const addFiles = Array.isArray(options?.addFiles) ? options.addFiles : [];
+    const removeAttachmentIds = Array.isArray(options?.removeAttachmentIds) ? options.removeAttachmentIds : [];
     try {
       await updateCipher(authedFetch, session, cipher, draft);
+      for (const attachmentId of removeAttachmentIds) {
+        const id = String(attachmentId || '').trim();
+        if (!id) continue;
+        await deleteCipherAttachment(authedFetch, cipher.id, id);
+      }
+      for (const file of addFiles) {
+        await uploadCipherAttachment(authedFetch, session, cipher.id, file, cipher);
+      }
       await Promise.all([ciphersQuery.refetch(), foldersQuery.refetch()]);
       pushToast('success', t('txt_item_updated'));
     } catch (error) {
       pushToast('error', error instanceof Error ? error.message : t('txt_update_item_failed'));
+      throw error;
+    }
+  }
+
+  async function downloadVaultAttachment(cipher: Cipher, attachmentId: string) {
+    if (!session) return;
+    try {
+      const file = await downloadCipherAttachmentDecrypted(authedFetch, session, cipher, attachmentId);
+      const fileName = String(file.fileName || '').trim() || 'attachment.bin';
+      const payload = new ArrayBuffer(file.bytes.byteLength);
+      new Uint8Array(payload).set(file.bytes);
+      const blob = new Blob([payload], { type: 'application/octet-stream' });
+      const href = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = href;
+      anchor.download = fileName;
+      anchor.rel = 'noopener';
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(href);
+    } catch (error) {
+      pushToast('error', error instanceof Error ? error.message : t('txt_download_failed'));
       throw error;
     }
   }
@@ -807,7 +1078,8 @@ export default function App() {
       return;
     }
     try {
-      await createFolder(authedFetch, folderName);
+      if (!session) throw new Error(t('txt_vault_key_unavailable'));
+      await createFolder(authedFetch, session, folderName);
       await foldersQuery.refetch();
       pushToast('success', t('txt_folder_created'));
     } catch (error) {
@@ -816,16 +1088,456 @@ export default function App() {
     }
   }
 
+  async function deleteFolderAction(folderId: string) {
+    const id = String(folderId || '').trim();
+    if (!id) {
+      pushToast('error', t('txt_folder_not_found'));
+      return;
+    }
+    try {
+      await deleteFolder(authedFetch, id);
+      await Promise.all([ciphersQuery.refetch(), foldersQuery.refetch()]);
+      pushToast('success', t('txt_folder_deleted'));
+    } catch (error) {
+      pushToast('error', error instanceof Error ? error.message : t('txt_delete_folder_failed'));
+      throw error;
+    }
+  }
+
+  function buildImportedCipherMaps(
+    payloadCiphers: Array<Record<string, unknown>>,
+    createdCipherIdsByIndex: Map<number, string>
+  ): { byIndex: Map<number, string>; bySourceId: Map<string, string> } {
+    const byIndex = new Map<number, string>(createdCipherIdsByIndex);
+    const bySourceId = new Map<string, string>();
+    for (const [index, id] of createdCipherIdsByIndex.entries()) {
+      const raw = (payloadCiphers[index] || {}) as Record<string, unknown>;
+      const sourceId = String(raw.id || '').trim();
+      if (sourceId) bySourceId.set(sourceId, id);
+    }
+    return { byIndex, bySourceId };
+  }
+
+  async function uploadImportedAttachments(
+    attachments: ImportAttachmentFile[],
+    idMaps: { byIndex: Map<number, string>; bySourceId: Map<string, string> }
+  ): Promise<void> {
+    if (!attachments.length) return;
+    if (!session?.symEncKey || !session?.symMacKey) throw new Error(t('txt_vault_key_unavailable'));
+
+    const initialCiphers = (await ciphersQuery.refetch()).data || [];
+    const cipherById = new Map(initialCiphers.map((cipher) => [String(cipher.id || ''), cipher]));
+    const unresolved: ImportAttachmentFile[] = [];
+
+    for (const attachment of attachments) {
+      const sourceId = String(attachment.sourceCipherId || '').trim();
+      const sourceIndex = Number(attachment.sourceCipherIndex);
+      const byId = sourceId ? idMaps.bySourceId.get(sourceId) : null;
+      const byIndex = Number.isFinite(sourceIndex) ? idMaps.byIndex.get(sourceIndex) : null;
+      const targetCipherId = byId || byIndex || null;
+      if (!targetCipherId) {
+        unresolved.push(attachment);
+        continue;
+      }
+
+      const name = String(attachment.fileName || '').trim() || 'attachment.bin';
+      const fileBytes = Uint8Array.from(attachment.bytes);
+      const file = new File([fileBytes], name, { type: 'application/octet-stream' });
+      const cipher = cipherById.get(targetCipherId) || null;
+      await uploadCipherAttachment(authedFetch, session, targetCipherId, file, cipher);
+    }
+
+    if (unresolved.length) {
+      throw new Error(t('txt_failed_to_map_attachments', { count: unresolved.length }));
+    }
+
+    await ciphersQuery.refetch();
+  }
+
+  function toImportedCipherMapsFromResponse(
+    cipherMap: ImportedCipherMapEntry[] | null
+  ): { byIndex: Map<number, string>; bySourceId: Map<string, string> } {
+    const byIndex = new Map<number, string>();
+    const bySourceId = new Map<string, string>();
+    for (const row of cipherMap || []) {
+      const idx = Number(row?.index);
+      const id = String(row?.id || '').trim();
+      if (!Number.isFinite(idx) || !id) continue;
+      byIndex.set(idx, id);
+      const sourceId = String(row?.sourceId || '').trim();
+      if (sourceId) bySourceId.set(sourceId, id);
+    }
+    return { byIndex, bySourceId };
+  }
+
+  async function handleImportAction(
+    payload: CiphersImportPayload,
+    options: { folderMode: 'original' | 'none' | 'target'; targetFolderId: string | null },
+    attachments: ImportAttachmentFile[] = []
+  ): Promise<ImportResultSummary> {
+    if (!session?.symEncKey || !session?.symMacKey) throw new Error(t('txt_vault_key_unavailable'));
+
+    const mode = options.folderMode || 'original';
+    const targetFolderId = (options.targetFolderId || '').trim() || null;
+    const folderIdByCipherIndex = new Map<number, string>();
+    let createdFolderCount = 0;
+    if (mode === 'original') {
+      const folderIdByImportIndex = new Map<number, string>();
+      const folderIdByLegacyId = new Map<string, string>();
+      const folderIdByName = new Map<string, string>();
+      const createdFolderIdByName = new Map<string, string>();
+      for (let i = 0; i < payload.folders.length; i++) {
+        const folderRaw = (payload.folders[i] || {}) as Record<string, unknown>;
+        const name = String(folderRaw.name || '').trim();
+        if (!name) continue;
+        let folderId = createdFolderIdByName.get(name) || null;
+        if (!folderId) {
+          const created = await createFolder(authedFetch, session, name);
+          folderId = created.id;
+          createdFolderIdByName.set(name, folderId);
+          createdFolderCount += 1;
+        }
+        folderIdByImportIndex.set(i, folderId);
+        folderIdByName.set(name, folderId);
+        const legacyId = String(folderRaw.id || '').trim();
+        if (legacyId) folderIdByLegacyId.set(legacyId, folderId);
+      }
+      for (const relation of payload.folderRelationships || []) {
+        const cipherIndex = Number(relation?.key);
+        const folderIndex = Number(relation?.value);
+        if (!Number.isFinite(cipherIndex) || !Number.isFinite(folderIndex)) continue;
+        const folderId = folderIdByImportIndex.get(folderIndex);
+        if (folderId) folderIdByCipherIndex.set(cipherIndex, folderId);
+      }
+      for (let i = 0; i < payload.ciphers.length; i++) {
+        if (folderIdByCipherIndex.has(i)) continue;
+        const raw = (payload.ciphers[i] || {}) as Record<string, unknown>;
+        const rawFolderId = String(raw.folderId || '').trim();
+        if (rawFolderId && folderIdByLegacyId.has(rawFolderId)) {
+          folderIdByCipherIndex.set(i, folderIdByLegacyId.get(rawFolderId)!);
+          continue;
+        }
+        const rawFolderName = String(raw.folder || '').trim();
+        if (rawFolderName && folderIdByName.has(rawFolderName)) {
+          folderIdByCipherIndex.set(i, folderIdByName.get(rawFolderName)!);
+        }
+      }
+    } else if (mode === 'target' && targetFolderId) {
+      for (let i = 0; i < payload.ciphers.length; i++) {
+        folderIdByCipherIndex.set(i, targetFolderId);
+      }
+    }
+
+    const createdCipherIdsByIndex = new Map<number, string>();
+    for (let i = 0; i < payload.ciphers.length; i++) {
+      const raw = (payload.ciphers[i] || {}) as Record<string, unknown>;
+      const draft = importCipherToDraft(raw, null);
+      const created = await createCipher(authedFetch, session, draft);
+      createdCipherIdsByIndex.set(i, created.id);
+    }
+
+    const moveIdsByFolderId = new Map<string, string[]>();
+    for (const [index, folderId] of folderIdByCipherIndex.entries()) {
+      const cipherId = createdCipherIdsByIndex.get(index);
+      if (!cipherId || !folderId) continue;
+      const group = moveIdsByFolderId.get(folderId) || [];
+      group.push(cipherId);
+      moveIdsByFolderId.set(folderId, group);
+    }
+    for (const [folderId, ids] of moveIdsByFolderId.entries()) {
+      await bulkMoveCiphers(authedFetch, ids, folderId);
+    }
+
+    const idMaps = buildImportedCipherMaps(payload.ciphers, createdCipherIdsByIndex);
+    await foldersQuery.refetch();
+    await ciphersQuery.refetch();
+    if (attachments.length) {
+      await uploadImportedAttachments(attachments, idMaps);
+    }
+    return summarizeImportResult(payload.ciphers, mode === 'original' ? createdFolderCount : 0);
+  }
+
+  async function handleImportEncryptedRawAction(
+    payload: CiphersImportPayload,
+    options: { folderMode: 'original' | 'none' | 'target'; targetFolderId: string | null },
+    attachments: ImportAttachmentFile[] = []
+  ): Promise<ImportResultSummary> {
+    const mode = options.folderMode || 'original';
+    const targetFolderId = (options.targetFolderId || '').trim() || null;
+    const nextPayload: CiphersImportPayload = {
+      ciphers: payload.ciphers.map((raw) => ({ ...(raw as Record<string, unknown>) })),
+      folders: mode === 'original' ? payload.folders : [],
+      folderRelationships: mode === 'original' ? payload.folderRelationships : [],
+    };
+    if (mode === 'none') {
+      for (const raw of nextPayload.ciphers) (raw as Record<string, unknown>).folderId = null;
+    } else if (mode === 'target' && targetFolderId) {
+      for (const raw of nextPayload.ciphers) (raw as Record<string, unknown>).folderId = targetFolderId;
+    }
+
+    const importedCipherMap = await importCiphers(authedFetch, nextPayload, {
+      returnCipherMap: attachments.length > 0,
+    });
+    await Promise.all([ciphersQuery.refetch(), foldersQuery.refetch()]);
+    if (attachments.length) {
+      const idMaps = toImportedCipherMapsFromResponse(importedCipherMap);
+      await uploadImportedAttachments(attachments, idMaps);
+    }
+    return summarizeImportResult(nextPayload.ciphers, mode === 'original' ? nextPayload.folders.length : 0);
+  }
+
+  async function handleExportAction(request: ExportRequest) {
+    if (!session?.symEncKey || !session?.symMacKey) throw new Error(t('txt_vault_key_unavailable'));
+    const masterPassword = String(request.masterPassword || '').trim();
+    if (!masterPassword) throw new Error(t('txt_master_password_is_required'));
+    const email = String(profile?.email || session.email || '').trim().toLowerCase();
+    if (!email) throw new Error(t('txt_profile_unavailable'));
+    const verifyDerived = await deriveLoginHash(email, masterPassword, defaultKdfIterations);
+    await verifyMasterPassword(authedFetch, verifyDerived.hash);
+
+    const rawFolders = foldersQuery.data || [];
+    const rawCiphers = ciphersQuery.data || [];
+    if (!rawFolders || !rawCiphers) throw new Error(t('txt_vault_not_ready'));
+
+    let plainJsonCache: string | null = null;
+    let plainJsonDocCache: Record<string, unknown> | null = null;
+    let encryptedJsonCache: string | null = null;
+    let nodeWardenAttachmentsCache: ReturnType<typeof buildNodeWardenAttachmentRecords> | null = null;
+    const getPlainJson = async () => {
+      if (!plainJsonCache) {
+        plainJsonCache = await buildPlainBitwardenJsonString({
+          folders: rawFolders,
+          ciphers: rawCiphers,
+          userEncB64: session.symEncKey!,
+          userMacB64: session.symMacKey!,
+        });
+      }
+      return plainJsonCache;
+    };
+    const getPlainJsonDoc = async () => {
+      if (!plainJsonDocCache) {
+        plainJsonDocCache = JSON.parse(await getPlainJson()) as Record<string, unknown>;
+      }
+      return plainJsonDocCache;
+    };
+    const getEncryptedJson = async () => {
+      if (!encryptedJsonCache) {
+        encryptedJsonCache = await buildAccountEncryptedBitwardenJsonString({
+          folders: rawFolders,
+          ciphers: rawCiphers,
+          userEncB64: session.symEncKey!,
+          userMacB64: session.symMacKey!,
+        });
+      }
+      return encryptedJsonCache;
+    };
+
+    const zipAttachments = async (): Promise<ZipAttachmentEntry[]> => {
+      const userEnc = base64ToBytes(session.symEncKey!);
+      const userMac = base64ToBytes(session.symMacKey!);
+      const out: ZipAttachmentEntry[] = [];
+      const activeCiphers = rawCiphers.filter((cipher) => !cipher.deletedDate && !(cipher as { organizationId?: unknown }).organizationId);
+
+      for (const cipher of activeCiphers) {
+        const cipherId = String(cipher.id || '').trim();
+        if (!cipherId) continue;
+        const attachments = Array.isArray(cipher.attachments) ? cipher.attachments : [];
+        if (!attachments.length) continue;
+
+        let itemEnc = userEnc;
+        let itemMac = userMac;
+        const itemKey = String(cipher.key || '').trim();
+        if (itemKey && looksLikeCipherString(itemKey)) {
+          try {
+            const rawItemKey = await decryptBw(itemKey, userEnc, userMac);
+            if (rawItemKey.length >= 64) {
+              itemEnc = rawItemKey.slice(0, 32);
+              itemMac = rawItemKey.slice(32, 64);
+            }
+          } catch {
+            // fallback to user key
+          }
+        }
+
+        for (const attachment of attachments) {
+          const attachmentId = String(attachment?.id || '').trim();
+          if (!attachmentId) continue;
+          const info = await getAttachmentDownloadInfo(authedFetch, cipherId, attachmentId);
+          const fileResp = await fetch(info.url, { cache: 'no-store' });
+          if (!fileResp.ok) throw new Error(`Failed to download attachment ${attachmentId}`);
+          const encryptedBytes = new Uint8Array(await fileResp.arrayBuffer());
+
+          let fileEnc = itemEnc;
+          let fileMac = itemMac;
+          const attachmentKeyCipher = String(info.key || attachment?.key || '').trim();
+          if (attachmentKeyCipher && looksLikeCipherString(attachmentKeyCipher)) {
+            try {
+              const rawAttachmentKey = await decryptBw(attachmentKeyCipher, itemEnc, itemMac);
+              if (rawAttachmentKey.length >= 64) {
+                fileEnc = rawAttachmentKey.slice(0, 32);
+                fileMac = rawAttachmentKey.slice(32, 64);
+              }
+            } catch {
+              // fallback to item key
+            }
+          }
+
+          const plainBytes = await decryptBwFileData(encryptedBytes, fileEnc, fileMac);
+
+          const fileNameRaw = String(info.fileName || attachment?.fileName || '').trim();
+          let fileName = fileNameRaw || `attachment-${attachmentId}`;
+          if (fileNameRaw && looksLikeCipherString(fileNameRaw)) {
+            try {
+              fileName = (await decryptStr(fileNameRaw, itemEnc, itemMac)) || fileName;
+            } catch {
+              // fallback to raw encrypted name
+            }
+          }
+
+          out.push({
+            cipherId,
+            fileName,
+            bytes: plainBytes,
+          });
+        }
+      }
+      return out;
+    };
+
+    const getNodeWardenAttachmentRecords = async () => {
+      if (nodeWardenAttachmentsCache) return nodeWardenAttachmentsCache;
+      const [doc, attachments] = await Promise.all([getPlainJsonDoc(), zipAttachments()]);
+      const cipherIndexById = new Map<string, number>();
+      const items = Array.isArray(doc.items) ? (doc.items as Array<Record<string, unknown>>) : [];
+      for (let i = 0; i < items.length; i++) {
+        const id = String(items[i]?.id || '').trim();
+        if (id) cipherIndexById.set(id, i);
+      }
+      nodeWardenAttachmentsCache = buildNodeWardenAttachmentRecords(attachments, cipherIndexById);
+      return nodeWardenAttachmentsCache;
+    };
+
+    const format = request.format;
+    if (format === 'bitwarden_json') {
+      const bytes = new TextEncoder().encode(await getPlainJson());
+      return {
+        fileName: buildExportFileName(format),
+        mimeType: 'application/json',
+        bytes,
+      };
+    }
+
+    if (format === 'bitwarden_encrypted_json') {
+      if (request.encryptedJsonMode === 'password') {
+        const plainJson = await getPlainJson();
+        const kdf = await getPreloginKdfConfig(profile?.email || session.email, defaultKdfIterations);
+        const encrypted = await buildPasswordProtectedBitwardenJsonString({
+          plaintextJson: plainJson,
+          password: String(request.filePassword || ''),
+          kdf,
+        });
+        return {
+          fileName: buildExportFileName(format),
+          mimeType: 'application/json',
+          bytes: new TextEncoder().encode(encrypted),
+        };
+      }
+      const bytes = new TextEncoder().encode(await getEncryptedJson());
+      return {
+        fileName: buildExportFileName(format),
+        mimeType: 'application/json',
+        bytes,
+      };
+    }
+
+    if (format === 'nodewarden_json') {
+      const [plainDoc, attachments] = await Promise.all([getPlainJsonDoc(), getNodeWardenAttachmentRecords()]);
+      const nodeWardenDoc = buildNodeWardenPlainJsonDocument(plainDoc, attachments);
+      return {
+        fileName: buildExportFileName(format),
+        mimeType: 'application/json',
+        bytes: new TextEncoder().encode(JSON.stringify(nodeWardenDoc, null, 2)),
+      };
+    }
+
+    if (format === 'nodewarden_encrypted_json') {
+      if (request.encryptedJsonMode === 'password') {
+        const [plainDoc, attachments] = await Promise.all([getPlainJsonDoc(), getNodeWardenAttachmentRecords()]);
+        const nodeWardenDoc = buildNodeWardenPlainJsonDocument(plainDoc, attachments);
+        const kdf = await getPreloginKdfConfig(profile?.email || session.email, defaultKdfIterations);
+        const encrypted = await buildPasswordProtectedBitwardenJsonString({
+          plaintextJson: JSON.stringify(nodeWardenDoc, null, 2),
+          password: String(request.filePassword || ''),
+          kdf,
+        });
+        return {
+          fileName: buildExportFileName(format),
+          mimeType: 'application/json',
+          bytes: new TextEncoder().encode(encrypted),
+        };
+      }
+
+      const [encryptedJson, attachments] = await Promise.all([getEncryptedJson(), getNodeWardenAttachmentRecords()]);
+      const withAttachments = await attachNodeWardenEncryptedAttachmentPayload(
+        encryptedJson,
+        attachments,
+        session.symEncKey!,
+        session.symMacKey!
+      );
+      return {
+        fileName: buildExportFileName(format),
+        mimeType: 'application/json',
+        bytes: new TextEncoder().encode(withAttachments),
+      };
+    }
+
+    if (format === 'bitwarden_json_zip' || format === 'bitwarden_encrypted_json_zip') {
+      let dataJson = await getPlainJson();
+      if (format === 'bitwarden_encrypted_json_zip') {
+        if (request.encryptedJsonMode === 'password') {
+          const kdf = await getPreloginKdfConfig(profile?.email || session.email, defaultKdfIterations);
+          dataJson = await buildPasswordProtectedBitwardenJsonString({
+            plaintextJson: await getPlainJson(),
+            password: String(request.filePassword || ''),
+            kdf,
+          });
+        } else {
+          dataJson = await getEncryptedJson();
+        }
+      }
+      const attachments = await zipAttachments();
+      const zipBytes = buildBitwardenZipBytes(dataJson, attachments);
+      const encryptedZip = await encryptZipBytesWithPassword(zipBytes, String(request.zipPassword || ''));
+      return {
+        fileName: buildExportFileName(format, encryptedZip.encrypted),
+        mimeType: 'application/zip',
+        bytes: encryptedZip.bytes,
+      };
+    }
+
+    throw new Error(t('txt_unsupported_export_format'));
+  }
+
   const hashPathRaw = typeof window !== 'undefined' ? window.location.hash || '' : '';
   const hashPath = hashPathRaw.startsWith('#') ? hashPathRaw.slice(1) : hashPathRaw;
+  const hashPathOnly = String(hashPath || '').split('?')[0].split('#')[0];
+  const normalizedHashPath = `/${hashPathOnly.replace(/^\/+/, '').replace(/\/+$/, '')}`.replace(/^\/$/, '/');
+  const isImportHashRoute = IMPORT_ROUTE_ALIASES.has(normalizedHashPath);
   const effectiveLocation = hashPath.startsWith('/send/') || hashPath === '/recover-2fa' ? hashPath : location;
   const publicSendMatch = effectiveLocation.match(/^\/send\/([^/]+)(?:\/([^/]+))?\/?$/i);
   const isRecoverTwoFactorRoute = effectiveLocation === '/recover-2fa';
   const isPublicSendRoute = !!publicSendMatch;
+  const isImportRoute = location === IMPORT_ROUTE || IMPORT_ROUTE_ALIASES.has(location);
 
   useEffect(() => {
     if (phase === 'app' && location === '/' && !isPublicSendRoute) navigate('/vault');
   }, [phase, location, isPublicSendRoute, navigate]);
+
+  useEffect(() => {
+    if (phase === 'app' && isImportHashRoute && location !== IMPORT_ROUTE) {
+      navigate(IMPORT_ROUTE);
+    }
+  }, [phase, isImportHashRoute, location, navigate]);
 
   if (jwtWarning) {
     return <JwtWarningPage reason={jwtWarning.reason} minLength={jwtWarning.minLength} />;
@@ -982,7 +1694,7 @@ export default function App() {
                 <Cloud size={16} />
                 <span>{t('nav_backup_strategy')}</span>
               </Link>
-              <Link href="/help/import-export" className={`side-link ${location === '/help/import-export' ? 'active' : ''}`}>
+              <Link href={IMPORT_ROUTE} className={`side-link ${isImportRoute ? 'active' : ''}`}>
                 <ArrowUpDown size={14} />
                 <span>{t('nav_import_export')}</span>
               </Link>
@@ -1016,6 +1728,8 @@ export default function App() {
                     onVerifyMasterPassword={verifyMasterPasswordAction}
                     onNotify={pushToast}
                     onCreateFolder={createFolderAction}
+                    onDeleteFolder={deleteFolderAction}
+                    onDownloadAttachment={downloadVaultAttachment}
                   />
                 </Route>
                 <Route path="/settings">
@@ -1130,8 +1844,65 @@ export default function App() {
                     }}
                   />
                 </Route>
-                <Route path="/help/import-export">
-                  <ImportExportPage />
+                <Route path={IMPORT_ROUTE}>
+                  <ImportPage
+                    onImport={handleImportAction}
+                    onImportEncryptedRaw={handleImportEncryptedRawAction}
+                    accountKeys={session?.symEncKey && session?.symMacKey ? { encB64: session.symEncKey, macB64: session.symMacKey } : null}
+                    onNotify={pushToast}
+                    folders={decryptedFolders}
+                    onExport={handleExportAction}
+                  />
+                </Route>
+                <Route path="/tools/import">
+                  <ImportPage
+                    onImport={handleImportAction}
+                    onImportEncryptedRaw={handleImportEncryptedRawAction}
+                    accountKeys={session?.symEncKey && session?.symMacKey ? { encB64: session.symEncKey, macB64: session.symMacKey } : null}
+                    onNotify={pushToast}
+                    folders={decryptedFolders}
+                    onExport={handleExportAction}
+                  />
+                </Route>
+                <Route path="/tools/import-export">
+                  <ImportPage
+                    onImport={handleImportAction}
+                    onImportEncryptedRaw={handleImportEncryptedRawAction}
+                    accountKeys={session?.symEncKey && session?.symMacKey ? { encB64: session.symEncKey, macB64: session.symMacKey } : null}
+                    onNotify={pushToast}
+                    folders={decryptedFolders}
+                    onExport={handleExportAction}
+                  />
+                </Route>
+                <Route path="/tools/import-data">
+                  <ImportPage
+                    onImport={handleImportAction}
+                    onImportEncryptedRaw={handleImportEncryptedRawAction}
+                    accountKeys={session?.symEncKey && session?.symMacKey ? { encB64: session.symEncKey, macB64: session.symMacKey } : null}
+                    onNotify={pushToast}
+                    folders={decryptedFolders}
+                    onExport={handleExportAction}
+                  />
+                </Route>
+                <Route path="/import">
+                  <ImportPage
+                    onImport={handleImportAction}
+                    onImportEncryptedRaw={handleImportEncryptedRawAction}
+                    accountKeys={session?.symEncKey && session?.symMacKey ? { encB64: session.symEncKey, macB64: session.symMacKey } : null}
+                    onNotify={pushToast}
+                    folders={decryptedFolders}
+                    onExport={handleExportAction}
+                  />
+                </Route>
+                <Route path="/import-export">
+                  <ImportPage
+                    onImport={handleImportAction}
+                    onImportEncryptedRaw={handleImportEncryptedRawAction}
+                    accountKeys={session?.symEncKey && session?.symMacKey ? { encB64: session.symEncKey, macB64: session.symMacKey } : null}
+                    onNotify={pushToast}
+                    folders={decryptedFolders}
+                    onExport={handleExportAction}
+                  />
                 </Route>
                 <Route path="/help">
                   <HelpPage />

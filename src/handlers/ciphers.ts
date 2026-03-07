@@ -40,6 +40,28 @@ export function normalizeCipherLoginForCompatibility(login: any): any {
   };
 }
 
+// Android 2026.2.0 requires sshKey.keyFingerprint in sync payloads.
+// Keep legacy alias "fingerprint" in parallel for older web payloads.
+export function normalizeCipherSshKeyForCompatibility(sshKey: any): any {
+  if (!sshKey || typeof sshKey !== 'object') return sshKey ?? null;
+
+  const candidate =
+    sshKey.keyFingerprint !== undefined && sshKey.keyFingerprint !== null
+      ? sshKey.keyFingerprint
+      : sshKey.fingerprint;
+
+  const normalizedFingerprint =
+    candidate === undefined || candidate === null
+      ? ''
+      : String(candidate);
+
+  return {
+    ...sshKey,
+    keyFingerprint: normalizedFingerprint,
+    fingerprint: normalizedFingerprint,
+  };
+}
+
 // Format attachments for API response
 export function formatAttachments(attachments: Attachment[]): any[] | null {
   if (attachments.length === 0) return null;
@@ -63,6 +85,7 @@ export function cipherToResponse(cipher: Cipher, attachments: Attachment[] = [])
   // Strip internal-only fields that must not appear in the API response
   const { userId, createdAt, updatedAt, deletedAt, ...passthrough } = cipher;
   const normalizedLogin = normalizeCipherLoginForCompatibility((passthrough as any).login ?? null);
+  const normalizedSshKey = normalizeCipherSshKeyForCompatibility((passthrough as any).sshKey ?? null);
 
   return {
     // Pass through ALL stored cipher fields (known + unknown)
@@ -85,6 +108,7 @@ export function cipherToResponse(cipher: Cipher, attachments: Attachment[] = [])
     collectionIds: [],
     attachments: formatAttachments(attachments),
     login: normalizedLogin,
+    sshKey: normalizedSshKey,
     encryptedFor: null,
   };
 }
@@ -181,6 +205,7 @@ export async function handleCreateCipher(request: Request, env: Env, userId: str
     deletedAt: null,
   };
   cipher.login = normalizeCipherLoginForCompatibility(cipher.login);
+  cipher.sshKey = normalizeCipherSshKeyForCompatibility(cipher.sshKey);
   const createFields = getAliasedProp(cipherData, ['fields', 'Fields']);
   cipher.fields = createFields.present ? (createFields.value ?? null) : (cipher.fields ?? null);
 
@@ -232,6 +257,7 @@ export async function handleUpdateCipher(request: Request, env: Env, userId: str
     deletedAt: existingCipher.deletedAt,
   };
   cipher.login = normalizeCipherLoginForCompatibility(cipher.login);
+  cipher.sshKey = normalizeCipherSshKeyForCompatibility(cipher.sshKey);
 
   // Custom fields deletion compatibility:
   // - Accept both camelCase "fields" and PascalCase "Fields".
