@@ -2,25 +2,24 @@
 import { argon2idAsync } from '@noble/hashes/argon2.js';
 import { strFromU8, unzipSync } from 'fflate';
 import { BlobReader, Uint8ArrayWriter, ZipReader, configure as configureZipJs } from '@zip.js/zip.js';
-import { Archive, ArrowLeftRight, Download, FileJson, FileUp } from 'lucide-preact';
+import { Download, FileUp } from 'lucide-preact';
 import ConfirmDialog from '@/components/ConfirmDialog';
-import type { CiphersImportPayload } from '@/lib/api';
+import type { CiphersImportPayload } from '@/lib/api/vault';
 import {
   type EncryptedJsonMode,
   EXPORT_FORMATS,
-  type ExportDownloadPayload,
   type ExportFormatId,
   type ExportRequest,
 } from '@/lib/export-formats';
 import {
-  getFileAcceptBySource,
-  IMPORT_SOURCES,
-  type BitwardenJsonInput,
-  type ImportSourceId,
-  normalizeBitwardenEncryptedAccountImport,
-  normalizeBitwardenImport,
   parseImportPayloadBySource,
 } from '@/lib/import-formats';
+import { getFileAcceptBySource, IMPORT_SOURCES, type ImportSourceId } from '@/lib/import-format-sources';
+import {
+  type BitwardenJsonInput,
+  normalizeBitwardenEncryptedAccountImport,
+  normalizeBitwardenImport,
+} from '@/lib/import-formats-bitwarden';
 import { base64ToBytes, decryptStr, hkdfExpand, pbkdf2 } from '@/lib/crypto';
 import { t } from '@/lib/i18n';
 import type { Folder } from '@/lib/types';
@@ -48,13 +47,16 @@ interface ImportPageProps {
   accountKeys?: { encB64: string; macB64: string } | null;
   onNotify: (type: 'success' | 'error', text: string) => void;
   folders: Folder[];
-  onExport: (request: ExportRequest) => Promise<ExportDownloadPayload>;
+  onExport: (request: ExportRequest) => Promise<void>;
 }
 
 export interface ImportResultSummary {
   totalItems: number;
   folderCount: number;
   typeCounts: Array<{ label: string; count: number }>;
+  attachmentCount: number;
+  importedAttachmentCount: number;
+  failedAttachments: Array<{ fileName: string; reason: string }>;
 }
 
 interface BitwardenPasswordProtectedInput extends BitwardenJsonInput {
@@ -536,23 +538,13 @@ export default function ImportPage({ onImport, onImportEncryptedRaw, accountKeys
 
     setIsExporting(true);
     try {
-      const payload = await onExport({
+      await onExport({
         format: exportFormat,
         encryptedJsonMode: exportNeedsMode ? encryptedJsonMode : undefined,
         filePassword,
         zipPassword: exportIsZip ? zipPass : '',
         masterPassword,
       });
-      const blobBytes = Uint8Array.from(payload.bytes);
-      const blob = new Blob([blobBytes], { type: payload.mimeType });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = payload.fileName;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
       onNotify('success', t('txt_export_completed'));
     } catch (error) {
       const message = error instanceof Error ? error.message : t('txt_export_failed');
@@ -582,46 +574,10 @@ export default function ImportPage({ onImport, onImportEncryptedRaw, accountKeys
 
   return (
     <div className="import-export-page">
-      <section className="card import-export-hero">
-        <h3>{t('txt_import_export_title')}</h3>
-        <p className="import-export-hero-sub">{t('txt_import_export_feature_intro')}</p>
-        <div className="import-export-feature-grid">
-          <article className="import-export-feature-item">
-            <span className="import-export-feature-icon">
-              <Archive size={16} />
-            </span>
-            <div>
-              <strong>{t('txt_import_export_feature_bw_zip_title')}</strong>
-              <p>{t('txt_import_export_feature_bw_zip_desc')}</p>
-            </div>
-          </article>
-          <article className="import-export-feature-item">
-            <span className="import-export-feature-icon">
-              <FileJson size={16} />
-            </span>
-            <div>
-              <strong>{t('txt_import_export_feature_nodewarden_json_title')}</strong>
-              <p>{t('txt_import_export_feature_nodewarden_json_desc')}</p>
-            </div>
-          </article>
-          <article className="import-export-feature-item">
-            <span className="import-export-feature-icon">
-              <ArrowLeftRight size={16} />
-            </span>
-            <div>
-              <strong>{t('txt_import_export_feature_compat_title')}</strong>
-              <p>{t('txt_import_export_feature_compat_desc')}</p>
-            </div>
-          </article>
-        </div>
-      </section>
-
       <div className="import-export-panels">
       <section className="card import-export-panel">
         <h3>{t('txt_import')}</h3>
-        <p className="muted" style={{ textAlign: 'left', marginBottom: 12 }}>
-          {t('txt_import_vault_data_hint')}
-        </p>
+        <p className="backup-inline-note">{t('txt_import_vault_data_hint')}</p>
         <div className="field-grid">
           <label className="field field-span-2">
             <span>{t('txt_format')}</span>
@@ -702,9 +658,7 @@ export default function ImportPage({ onImport, onImportEncryptedRaw, accountKeys
 
       <section className="card import-export-panel">
         <h3>{t('txt_export')}</h3>
-        <p className="muted" style={{ textAlign: 'left', marginBottom: 12 }}>
-          {t('txt_export_vault_data_hint')}
-        </p>
+        <p className="backup-inline-note">{t('txt_export_vault_data_hint')}</p>
         <div className="field-grid">
           <label className="field field-span-2">
             <span>{t('txt_format')}</span>
@@ -862,6 +816,29 @@ export default function ImportPage({ onImport, onImportEncryptedRaw, accountKeys
             </button>
             <h3 className="dialog-title">{t('txt_import_success')}</h3>
             <div className="dialog-message">{t('txt_import_success_number_of_items', { count: importSummary.totalItems })}</div>
+            {importSummary.attachmentCount > 0 && (
+              <div className="dialog-message">
+                {t('txt_import_attachment_summary', {
+                  imported: String(importSummary.importedAttachmentCount),
+                  total: String(importSummary.attachmentCount),
+                })}
+              </div>
+            )}
+            {importSummary.failedAttachments.length > 0 && (
+              <div className="import-summary-failed-list">
+                <div className="import-summary-failed-title">
+                  {t('txt_import_failed_attachments_title', { count: String(importSummary.failedAttachments.length) })}
+                </div>
+                <ul>
+                  {importSummary.failedAttachments.map((row, index) => (
+                    <li key={`${row.fileName}-${index}`}>
+                      <strong>{row.fileName}</strong>
+                      {`: ${row.reason}`}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             <div className="import-summary-table-wrap">
               <table className="import-summary-table">
                 <thead>

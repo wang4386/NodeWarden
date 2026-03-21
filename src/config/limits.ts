@@ -44,6 +44,12 @@
     // Sensitive public/auth request budget per IP per minute.
     // 敏感公开/认证接口每 IP 每分钟请求配额。
     sensitivePublicRequestsPerMinute: 30,
+    // Password hint lookup budget per IP per minute.
+    // 密码提示查询接口每 IP 每分钟请求配额。
+    passwordHintRequestsPerMinute: 1,
+    // Password hint lookup budget per IP per hour.
+    // 密码提示查询接口每 IP 每小时请求配额。
+    passwordHintRequestsPerHour: 3,
     // Register endpoint budget per IP per minute.
     // 注册接口每 IP 每分钟请求配额。
     registerRequestsPerMinute: 5,
@@ -107,6 +113,12 @@
     // In-memory /api/sync response cache TTL (milliseconds).
     // /api/sync 内存缓存有效期（毫秒）。
     syncResponseTtlMs: 30 * 1000,
+    // Max size of a single cached /api/sync body in bytes.
+    // 单个 /api/sync 缓存响应允许的最大字节数。
+    syncResponseMaxBodyBytes: 512 * 1024,
+    // Max total in-memory bytes used by /api/sync cache per isolate.
+    // 每个 isolate 中 /api/sync 缓存允许占用的最大总字节数。
+    syncResponseMaxTotalBytes: 2 * 1024 * 1024,
     // Max in-memory /api/sync cache entries per isolate.
     // 每个 isolate 的 /api/sync 最大缓存条目数。
     syncResponseMaxEntries: 64,
